@@ -40,6 +40,7 @@ procinit(void)
       uint64 va = KSTACK((int) (p - proc));
       kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
       p->kstack = va;
+      p->kstack_pa = (uint64) pa;
   }
   kvminithart();
 }
@@ -121,12 +122,16 @@ found:
     return 0;
   }
 
+  p->k_pagetable = k_kvminit();
+  if(mappages(p->k_pagetable, p->kstack, PGSIZE, p->kstack_pa, PTE_R | PTE_W) != 0)
+    panic("kvmmap");
+  
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
-
+  // xxx(p);
   return p;
 }
 
@@ -141,6 +146,30 @@ freeproc(struct proc *p)
   p->trapframe = 0;
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
+  if(p->k_pagetable){
+    for(int i = 0; i < 512; i++){
+      pte_t pte = p->k_pagetable[i];
+      if(pte & PTE_V){
+        // this PTE points to a lower-level page table.
+        pagetable_t child = (pagetable_t) PTE2PA(pte);
+        for(int j=0;j<512;j++){
+          pte_t pte_child = child[j];
+          if(pte_child & PTE_V){
+            pagetable_t leaf = (pagetable_t) PTE2PA(pte_child);
+            for(int k = 0;k<512;k++){
+              leaf[k]=0;
+            }
+            child[j]=0;
+            kfree((void*) leaf);
+          }
+        } 
+        p->k_pagetable[i]=0;
+        kfree((void*) child);
+      }
+    }
+    kfree((void*)p->k_pagetable);
+  }
+  p->k_pagetable = 0;
   p->pagetable = 0;
   p->sz = 0;
   p->pid = 0;
@@ -151,6 +180,7 @@ freeproc(struct proc *p)
   p->xstate = 0;
   p->state = UNUSED;
 }
+
 
 // Create a user page table for a given process,
 // with no user memory, but with trampoline pages.
@@ -221,6 +251,7 @@ userinit(void)
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
 
+  xxx(p->pagetable, p->k_pagetable,0,p->sz);
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
   p->trapframe->sp = PGSIZE;  // user stack pointer
@@ -229,7 +260,7 @@ userinit(void)
   p->cwd = namei("/");
 
   p->state = RUNNABLE;
-
+  
   release(&p->lock);
 }
 
@@ -250,6 +281,7 @@ growproc(int n)
     sz = uvmdealloc(p->pagetable, sz, sz + n);
   }
   p->sz = sz;
+  // xxx(p);
   return 0;
 }
 
@@ -275,6 +307,7 @@ fork(void)
   }
   np->sz = p->sz;
 
+  xxx(np->pagetable,np->k_pagetable,0,np->sz);
   np->parent = p;
 
   // copy saved user registers.
@@ -296,7 +329,8 @@ fork(void)
   np->state = RUNNABLE;
 
   release(&np->lock);
-
+  // xxx(p);
+  // xxx(np);
   return pid;
 }
 
@@ -473,12 +507,14 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+        w_satp(MAKE_SATP(p->k_pagetable));
+        sfence_vma();
         swtch(&c->context, &p->context);
-
+        
         // Process is done running for now.
         // It should have changed its p->state before coming back.
         c->proc = 0; // cpu dosen't run any process now
-
+        kvminithart();
         found = 1;
       }
       release(&p->lock);
@@ -662,7 +698,7 @@ either_copyin(void *dst, int user_src, uint64 src, uint64 len)
 {
   struct proc *p = myproc();
   if(user_src){
-    return copyin(p->pagetable, dst, src, len);
+    return copyin_new(p->pagetable, dst, src, len);
   } else {
     memmove(dst, (char*)src, len);
     return 0;
@@ -697,3 +733,35 @@ procdump(void)
     printf("\n");
   }
 }
+
+
+pte_t *
+k_walk(pagetable_t pagetable, uint64 va, int alloc)
+{
+  if(va >= MAXVA)
+    panic("k_walk");
+  for(int level = 2; level > 1; level--) {
+    pte_t *pte = &pagetable[PX(level, va)];
+    if(*pte & PTE_V) {
+      pagetable = (pagetable_t)PTE2PA(*pte);
+    } else {
+      if(!alloc || (pagetable = (pde_t*)kalloc()) == 0){
+        return 0;
+      }
+      memset(pagetable, 0, PGSIZE);
+      *pte = PA2PTE(pagetable) | PTE_V;
+    }
+  }
+  return &pagetable[PX(1, va)];
+}
+void xxx(pagetable_t pagetable,pagetable_t k_pagetable,uint64 start,uint64 end)
+{
+  pte_t *pte;
+  pte_t *k_pte;
+  for(uint64 i=start;i<end;i+=PGSIZE){
+    pte = walk(pagetable,i,0);
+    k_pte = walk(k_pagetable,i,1);
+    *k_pte = (*pte) &(~PTE_U);
+  }
+}
+

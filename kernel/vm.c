@@ -73,14 +73,14 @@ walk(pagetable_t pagetable, uint64 va, int alloc)
 {
   if(va >= MAXVA)
     panic("walk");
-
   for(int level = 2; level > 0; level--) {
     pte_t *pte = &pagetable[PX(level, va)];
     if(*pte & PTE_V) {
       pagetable = (pagetable_t)PTE2PA(*pte);
     } else {
-      if(!alloc || (pagetable = (pde_t*)kalloc()) == 0)
+      if(!alloc || (pagetable = (pde_t*)kalloc()) == 0){
         return 0;
+      }
       memset(pagetable, 0, PGSIZE);
       *pte = PA2PTE(pagetable) | PTE_V;
     }
@@ -150,14 +150,15 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
 {
   uint64 a, last;
   pte_t *pte;
-
+  
   a = PGROUNDDOWN(va);
   last = PGROUNDDOWN(va + size - 1);
   for(;;){
     if((pte = walk(pagetable, a, 1)) == 0)
       return -1;
-    if(*pte & PTE_V)
+    if(*pte & PTE_V){
       panic("remap");
+    }
     *pte = PA2PTE(pa) | perm | PTE_V;
     if(a == last)
       break;
@@ -450,3 +451,88 @@ test_pagetable()
   uint64 gsatp = MAKE_SATP(kernel_pagetable);
   return satp != gsatp;
 }
+
+void
+vmprint(pagetable_t pgtbl)
+{
+  printf("page table %p\n", pgtbl);
+  // there are 2^9 = 512 PTEs in a page table.
+  for(int i = 0; i < 512; i++){
+    pte_t pte = pgtbl[i];
+    if(pte & PTE_V){
+      // this PTE points to a lower-level page table.
+      printf("||%d: pte %p pa %p\n",i,pte,PTE2PA(pte));
+      pagetable_t child = (pagetable_t) PTE2PA(pte);
+      for(int j=0;j<512;j++){
+        pte_t pte_child = child[j];
+        if(pte_child & PTE_V){
+          printf("|| ||%d: pte %p pa %p\n",j,pte_child,PTE2PA(pte_child));
+          pagetable_t leaf = (pagetable_t) PTE2PA(pte_child);
+          for(int k = 0;k<512;k++){
+            pte_t pte_leaf = leaf[k];
+            if(pte_leaf & PTE_V){
+              printf("|| || ||%d: pte %p pa %p\n",k,pte_leaf,PTE2PA(pte_leaf));
+            }
+          }
+        }
+      } 
+    }
+  }
+  
+}
+
+
+pagetable_t
+k_kvminit()
+{
+  pagetable_t k_pagetable = (pagetable_t) kalloc();
+  memset(k_pagetable, 0, PGSIZE);
+  // uart registers
+  //kvmmap(UART0, UART0, PGSIZE, PTE_R | PTE_W);
+  if(mappages(k_pagetable, UART0, PGSIZE, UART0, PTE_R | PTE_W) != 0){
+    printf("1\n");
+    panic("kvmmap");
+  }
+
+  // virtio mmio disk interface
+  //kvmmap(VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
+  if(mappages(k_pagetable, VIRTIO0, PGSIZE, VIRTIO0, PTE_R | PTE_W) != 0){
+    printf("2\n");
+    panic("kvmmap");
+  }  
+  
+  // CLINT
+  //kvmmap(CLINT, CLINT, 0x10000, PTE_R | PTE_W);
+
+  // PLIC
+  //kvmmap(PLIC, PLIC, 0x400000, PTE_R | PTE_W);
+  if(mappages(k_pagetable, PLIC, 0x400000, PLIC, PTE_R | PTE_W) != 0){
+    printf("3\n");
+    panic("kvmmap");
+  }
+  // map kernel text executable and read-only.
+  //kvmmap(KERNBASE, KERNBASE, (uint64)etext-KERNBASE, PTE_R | PTE_X);
+  if(mappages(k_pagetable, KERNBASE, (uint64)etext-KERNBASE, KERNBASE, PTE_R | PTE_X) != 0){
+    printf("4\n");
+    panic("kvmmap");
+  }
+  // map kernel data and the physical RAM we'll make use of.
+  //kvmmap((uint64)etext, (uint64)etext, PHYSTOP-(uint64)etext, PTE_R | PTE_W);
+  if(mappages(k_pagetable,(uint64)etext, PHYSTOP-(uint64)etext, (uint64)etext, PTE_R | PTE_W) != 0){
+    //vmprint(k_pagetable);
+    printf("pagetable:%p\n",k_pagetable);
+    printf("5\n");
+    panic("kvmmap");
+  }
+  // map the trampoline for trap entry/exit to
+  // the highest virtual address in the kernel.
+  //kvmmap(TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+  if(mappages(k_pagetable,TRAMPOLINE, PGSIZE, (uint64)trampoline, PTE_R | PTE_X) != 0){
+    vmprint(k_pagetable);
+    printf("6\n");
+    panic("kvmmap");
+  }
+  return k_pagetable;
+}
+
+
